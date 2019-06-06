@@ -7,7 +7,7 @@ import sys
 
 import configparser
 from conans import ConanFile, tools
-from conans.errors import ConanInvalidConfiguration, ConanException
+from conans.errors import ConanInvalidConfiguration
 from conans.model import Generator
 
 
@@ -116,7 +116,8 @@ class QtConan(ConanFile):
         "cross_compile": None,
         "config": None,
         "multiconfiguration": False,
-    }, **{module: False for module in _submodules if module != 'qtbase'}
+        # revert following line before merging
+    }, **{module: (module == "qtwebengine") for module in _submodules if module != 'qtbase'}
     )
     requires = "zlib/1.2.11@conan/stable"
     short_paths = True
@@ -142,61 +143,69 @@ class QtConan(ConanFile):
         return ""
 
     def build_requirements(self):
-        pack_names = []
-
         if self.options.GUI:
+            pack_names = []
             if tools.os_info.with_apt:
                 pack_names = ["libxcb1-dev", "libx11-dev", "libc6-dev"]
             elif tools.os_info.is_linux and not tools.os_info.with_pacman:
                 pack_names = ["libxcb-devel", "libX11-devel", "glibc-devel"]
+
+            if pack_names:
+                installer = tools.SystemPackageTool()
+                for item in pack_names:
+                    installer.install(item + self._system_package_architecture())
 
         if self.options.qtwebengine:
             # gperf, bison, flex, python >= 2.7.5 & < 3
             if not tools.which("bison"):
                 self.build_requires("bison_installer/3.3.2@bincrafters/stable")
             if not tools.which("gperf"):
-                self.build_requires("gperf_installer/3.1@conan/stable")
+                tools.SystemPackageTool().install("gperf")
             if not tools.which("flex"):
                 self.build_requires("flex_installer/2.6.4@bincrafters/stable")
 
-            # Check if a valid python2 is available in PATH or it will fail
-            # Start by checking if python2 can be found
-            python_exe = tools.which("python2")
-            if not python_exe:
-                # Fall back on regular python
-                python_exe = tools.which("python")
+            def _check_python_version():
+                # Check if a valid python2 is available in PATH or it will failflex
+                # Start by checking if python2 can be found
+                python_exe = tools.which("python2")
+                if not python_exe:
+                    # Fall back on regular python
+                    python_exe = tools.which("python")
 
-            if not python_exe:
-                msg = ("Python2 must be available in PATH "
-                       "in order to build Qt WebEngine")
-                raise ConanInvalidConfiguration(msg)
-            # In any case, check its actual version for compatibility
-            from six import StringIO  # Python 2 and 3 compatible
-            from packaging.version import parse as parse_version
-            mybuf = StringIO()
-            cmd_v = "{} --version".format(python_exe)
-            self.run(cmd_v, output=mybuf)
-            version = parse_version(mybuf.getvalue().strip()
-                                         .split('Python ')[1])
-            # >= 2.7.5 & < 3
-            v_min = parse_version("2.7.5")
-            v_max = parse_version("3.0.0")
-            if (version >= v_min) and (version < v_max):
-                msg = ("Found valid Python2 required for QtWebengine:"
-                       " version={}, path={}".format(version, python_exe))
-                self.output.success(msg)
-            else:
-                msg = ("Found python2 in path, but with invalid version {}"
-                       " (QtWebEngine requires >= {} & < "
-                       "{})".format(version, v_min, v_max))
-                raise ConanInvalidConfiguration(msg)
+                if not python_exe:
+                    msg = ("Python2 must be available in PATH "
+                           "in order to build Qt WebEngine")
+                    raise ConanInvalidConfiguration(msg)
+                # In any case, check its actual version for compatibility
+                from six import StringIO  # Python 2 and 3 compatible
+                mybuf = StringIO()
+                cmd_v = "{} --version".format(python_exe)
+                self.run(cmd_v, output=mybuf)
+                version = tools.Version(mybuf.getvalue().strip()
+                                             .split('Python ')[1])
+                # >= 2.7.5 & < 3
+                v_min = "2.7.5"
+                v_max = "3.0.0"
+                if (version >= v_min) and (version < v_max):
+                    msg = ("Found valid Python 2 required for QtWebengine:"
+                           " version={}, path={}".format(version, python_exe))
+                    self.output.success(msg)
+                else:
+                    msg = ("Found Python 2 in path, but with invalid version {}"
+                           " (QtWebEngine requires >= {} & < "
+                           "{})".format(version, v_min, v_max))
+                    raise ConanInvalidConfiguration(msg)
 
-        if pack_names:
-            installer = tools.SystemPackageTool()
-            for item in pack_names:
-                installer.install(item + self._system_package_architecture())
-        if (tools.os_info.is_windows and
-            (self.settings.compiler == "Visual Studio")):
+            try:
+                _check_python_version()
+            except ConanInvalidConfiguration as e:
+                if tools.os_info.is_windows:
+                    raise e
+                self.output.info("Python 2 not detected in path. Trying to install it")
+                tools.SystemPackageTool().install(["python2", "python"])
+                _check_python_version()
+
+        if tools.os_info.is_windows and self.settings.compiler == "Visual Studio":
             self.build_requires("jom_installer/1.1.2@bincrafters/stable")
 
     def configure(self):
@@ -208,8 +217,7 @@ class QtConan(ConanFile):
             if self.settings.compiler == "gcc":
                 self.options.with_mysql = False
             if self.settings.compiler == "Visual Studio":
-                if (self.settings.compiler.runtime == "MT" or
-                    self.settings.compiler.runtime == "MTd"):
+                if self.settings.compiler.runtime == "MT" or self.settings.compiler.runtime == "MTd":
                     self.options.with_mysql = False
 
         if self.options.widgets:
@@ -231,14 +239,19 @@ class QtConan(ConanFile):
         if self.settings.os != "Linux":
             self.options.with_libalsa = False
 
-        if (not self.options.shared) and self.options.qtwebengine:
-            msg = "Static builds of Qt Webengine are not supported"
-            raise ConanInvalidConfiguration(msg)
+        if self.options.qtwebengine:
+            if not self.options.shared:
+                msg = "Static builds of Qt Webengine are not supported"
+                raise ConanInvalidConfiguration(msg)
+
+            if tools.cross_building(self.settings):
+                raise ConanInvalidConfiguration("Cross compiling Qt WebEngine is not supported")
+
+            if self.settings.compiler == "gcc" and tools.Version(self.settings.compiler.version) < "5":
+                raise ConanInvalidConfiguration("Compiling Qt WebEngine with gcc < 5 is not supported")
 
         if self.settings.os == "Android" and self.options.opengl == "desktop":
-            msg = ("OpenGL desktop is not supported on Android. "
-                   "Consider using OpenGL es2")
-            raise ConanInvalidConfiguration(msg)
+            raise ConanInvalidConfiguration("OpenGL desktop is not supported on Android. Consider using OpenGL es2")
 
         if self.settings.os == "Macos":
             del self.settings.os.version
@@ -278,7 +291,7 @@ class QtConan(ConanFile):
             self.options["freetype"].with_png = self.options.with_libpng
             self.options["freetype"].with_zlib = True
         # if self.options.with_icu:
-        #     self.requires("icu/64.2@bincrafters/testing")
+        #     self.requires("icu/63.1@bincrafters/stable")
         #     self.options["icu"].shared = self.options.shared
         if self.options.with_harfbuzz and not self.options.multiconfiguration:
             self.requires("harfbuzz/2.3.0@bincrafters/stable")
@@ -336,9 +349,12 @@ class QtConan(ConanFile):
         if self.options.qtwebengine:
             if tools.os_info.is_linux:
                 if tools.os_info.with_apt:
-                    # Actually a ton more:
-                    # https://wiki.qt.io/QtWebEngine/How_to_Try
-                    pack_names += ["libnss3-dev"]
+                    for lib in ["dbus-1", "fontconfig1", "nspr4", "nss3", "egl1-mesa", "drm",
+                                "xcomposite", "xcursor", "xi", "xrandr", "xss", "xtst"]:
+                        pack_names.append("lib" + lib + "-dev")
+                if tools.os_info.with_yum:
+                    for lib in ["drm", "Xcursor", "Xi", "Xrandr"]:
+                        pack_names.append("lib" + lib + "-devel")
 
         if pack_names:
             installer = tools.SystemPackageTool()
@@ -455,7 +471,7 @@ class QtConan(ConanFile):
         elif self.settings.build_type == "MinSizeRel":
             args.append("-release")
             args.append("-optimize-size")
-
+            
         for module in QtConan._submodules:
             if module != 'qtbase' and not getattr(self.options, module) \
                     and os.path.isdir(os.path.join(self.source_folder, 'qt5', QtConan._submodules[module]['path'])):
@@ -568,10 +584,9 @@ class QtConan(ConanFile):
         else:
             xplatform_val = self._xplatform()
             if xplatform_val:
-                if ((not tools.cross_building(self.settings)) or
-                    (self.settings.os_build == self.settings.os and
-                     self.settings.arch_build == "x86_64" and
-                     self.settings.arch == "x86")):
+                if (not tools.cross_building(self.settings)) or\
+                        (self.settings.os_build == self.settings.os and\
+                         self.settings.arch_build == "x86_64" and self.settings.arch == "x86"):
                     args += ["-platform %s" % xplatform_val]
                 else:
                     args += ["-xplatform %s" % xplatform_val]
